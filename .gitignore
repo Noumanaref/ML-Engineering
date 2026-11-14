@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+Untitled*.ipynb
+
+# Raw assessment data is not republished (put the CSVs in data/ locally)
+data/*.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
