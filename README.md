@@ -130,8 +130,8 @@ Requires **Python 3.10+**.
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/Noumanaref/freight-rate-challenge.git
-cd freight-rate-challenge
+git clone https://github.com/Noumanaref/ML-Engineering.git
+cd ML-Engineering
 
 # 2. Create and activate virtual environment
 python -m venv .venv
