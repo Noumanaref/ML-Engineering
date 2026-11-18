@@ -1,72 +1,73 @@
-"""Train the final model on all clean training data and write the submission files.
+"""Production CLI to train the final ensemble and generate submission files.
 
 Usage:
     python make_submission.py --data-dir data --out-dir .
-Outputs (written to --out-dir):
-    validation_predictions.csv      load_id,predicted_rate
-    december_chart_inputs.csv       the December file with predicted_rate filled in
+
+Outputs:
+    validation_predictions.csv      (load_id,predicted_rate)
+    december_chart_inputs.csv       (pickup,delivery,distance,equipment,weight,date,predicted_rate)
 """
+from __future__ import annotations
+
 import argparse
+import logging
+import sys
 from pathlib import Path
-import numpy as np
-import pandas as pd
 
-from freight_lib import (find, Cleaner, flag_corrupted, Hybrid, Blend, TARGET)
+from src.config import PipelineConfig
+from src.pipeline import run_pipeline
 
-WITH_TIME = ["log_dist", "market", "t"]
-NO_TIME = ["log_dist", "market"]
-BLEND_WEIGHTS = [0.7, 0.3]          # with-time, no-time (chosen in notebook 03b)
-DEFAULT_EXPECTED_ROWS = 12_000      # size of the real validation set
-
-
-def build_model():
-    return Blend([Hybrid(WITH_TIME), Hybrid(NO_TIME)], BLEND_WEIGHTS)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("make_submission")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--out-dir", default=".")
-    parser.add_argument("--expected-rows", type=int, default=DEFAULT_EXPECTED_ROWS,
-                        help="Row count the validation set must have (default 12000).")
-    args = parser.parse_args()
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train freight rate production model and write challenge submission files."
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="Path to directory containing input CSVs (default: data)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("."),
+        help="Path to directory where submission files are written (default: .)",
+    )
+    parser.add_argument(
+        "--expected-rows",
+        type=int,
+        default=12_000,
+        help="Expected validation row count (default: 12000)",
+    )
+    return parser.parse_args()
 
-    # 1. Load
-    train = pd.read_csv(find(args.data_dir, "train_test"), parse_dates=["date"])
-    val = pd.read_csv(find(args.data_dir, "validation"), parse_dates=["date"])
-    dec = pd.read_csv(find(args.data_dir, "december_chart_inputs"), parse_dates=["date"])
-    template = pd.read_csv(find(args.data_dir, "validation_predictions_template"))
 
-    # 2. Clean (fill values learned from train only; market_index looked up by day)
-    market_by_day = pd.concat([train, val]).groupby("date")["market_index"].median()
-    cleaner = Cleaner().fit(train)
-    train_c = cleaner.transform(train, market_by_day)
-    val_c = cleaner.transform(val, market_by_day)
-    dec_c = cleaner.transform(dec.drop(columns="predicted_rate"), market_by_day)
+def main() -> None:
+    args = parse_args()
+    logger.info("Starting freight rate production pipeline...")
+    logger.info("Data directory: %s", args.data_dir.resolve())
+    logger.info("Output directory: %s", args.out_dir.resolve())
 
-    # 3. Drop corrupted labels, then train on every clean row (Jan-Oct)
-    train_c["is_corrupted"] = flag_corrupted(train_c)
-    clean = train_c[~train_c["is_corrupted"]]
-    print(f"Training on {len(clean):,} clean rows ({train_c['is_corrupted'].sum()} dropped).")
-    model = build_model().fit(clean)
-
-    # 4. Predict validation, in template order
-    val_pred = pd.DataFrame({"load_id": val["load_id"], "predicted_rate": model.predict(val_c).round(2)})
-    submission = template[["load_id"]].merge(val_pred, on="load_id", how="left")
-    assert len(submission) == args.expected_rows, f"expected {args.expected_rows} rows, got {len(submission)}"
-    assert submission["predicted_rate"].notna().all(), "missing predictions"
-    assert (submission["predicted_rate"] > 0).all(), "non-positive predictions"
-    submission.to_csv(out_dir / "validation_predictions.csv", index=False)
-
-    # 5. Predict December (same model)
-    dec_out = dec.copy()
-    dec_out["predicted_rate"] = model.predict(dec_c).round(2)
-    dec_out["date"] = dec_out["date"].dt.strftime("%Y-%m-%d")
-    dec_out.to_csv(out_dir / "december_chart_inputs.csv", index=False)
-
-    print("Wrote validation_predictions.csv and december_chart_inputs.csv to", out_dir)
+    try:
+        val_path, dec_path = run_pipeline(
+            data_dir=args.data_dir,
+            output_dir=args.out_dir,
+            expected_rows=args.expected_rows,
+        )
+        logger.info("Submission successfully generated!")
+        logger.info("Validation predictions: %s", val_path)
+        logger.info("December chart inputs: %s", dec_path)
+    except Exception as exc:
+        logger.error("Pipeline execution failed: %s", exc, exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

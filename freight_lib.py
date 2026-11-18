@@ -1,140 +1,154 @@
-"""Shared code for the freight-rate project (cleaning, features, models, metrics)."""
-import glob, os
+"""Shared code for the freight-rate project (cleaning, features, models, metrics).
+
+Provides backward-compatible interfaces to the production `src` package.
+"""
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Sequence
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from sklearn.linear_model import Ridge
 
-TARGET = "posted_rate"
-EQUIPMENT = ["Dry Van", "Flatbed", "Reefer"]
-START_DATE = pd.Timestamp("2025-01-01")
-DIST_BINS = [0, 150, 300, 500, 800, 1200, 2000, 5000]
-DEFAULT_GBM = dict(n_estimators=300, learning_rate=0.05, num_leaves=15,
-                   min_child_samples=50, subsample=0.8, subsample_freq=1,
-                   colsample_bytree=0.8, random_state=0, verbose=-1)
-STATIC = ["log_dist", "weight", "equip"]
+from src.anomalies import flag_corrupted_labels
+from src.config import (
+    DISTANCE_BINS,
+    EQUIPMENT_TYPES,
+    FORWARD_FOLDS,
+    START_EPOCH,
+    TARGET_COLUMN,
+    LightGBMConfig,
+)
+from src.data_cleaning import DataCleaner, find_data_file
+from src.features import FeatureEngineer, STATIC_GBM_FEATURES
+from src.metrics import LookupTableBaseline, compute_metrics
+from src.models import GeometricBlendModel, HybridFreightModel
 
-FOLDS = {"V1": ("2025-07-01", "2025-08-31"), "V2": ("2025-08-01", "2025-09-30"),
-         "V3": ("2025-09-01", "2025-10-31"), "V4": ("2025-10-01", "2025-10-31")}
+# Aliases for backward compatibility
+TARGET = TARGET_COLUMN
+EQUIPMENT = list(EQUIPMENT_TYPES)
+START_DATE = START_EPOCH
+DIST_BINS = list(DISTANCE_BINS)
+DEFAULT_GBM = LightGBMConfig().to_dict()
+STATIC = STATIC_GBM_FEATURES
+FOLDS = FORWARD_FOLDS
 
 
-def find(data_dir, stem):
+def find(data_dir: Path | str, stem: str) -> str:
     """Find train_test.csv / train-test.csv / 'train-test (1).csv'."""
-    data_dir = Path(data_dir)
-    names = [stem, stem.replace("_", "-")]
-    for n in names:
-        if (data_dir / f"{n}.csv").is_file():
-            return str(data_dir / f"{n}.csv")
-    for n in names:
-        hits = sorted(glob.glob(str(data_dir / f"{n} (*).csv")))
-        if hits:
-            return hits[0]
-    raise FileNotFoundError(f"Could not find {stem}.csv in {data_dir}.")
+    return str(find_data_file(data_dir, stem))
 
 
 class Cleaner:
     """Fix weights and market_index. Fill values are learned from train only."""
-    def fit(self, df):
-        w = df["weight"].abs()
-        self.weight_by_equipment = w.groupby(df["equipment"]).median().to_dict()
-        self.weight_overall = w.median()
+
+    def __init__(self) -> None:
+        self._cleaner = DataCleaner()
+
+    def fit(self, df: pd.DataFrame) -> "Cleaner":
+        self._cleaner.fit(df)
+        self.weight_by_equipment = self._cleaner.equipment_weight_medians
+        self.weight_overall = self._cleaner.overall_weight_median
         return self
 
-    def transform(self, df, market_by_day):
-        out = df.copy()
-        out["weight"] = out["weight"].abs()
-        out["weight"] = (out["weight"]
-                         .fillna(out["equipment"].map(self.weight_by_equipment))
-                         .fillna(self.weight_overall))
-        if "market_index" in out:
-            out["market_index"] = out["market_index"].fillna(out["date"].map(market_by_day))
-        else:
-            out["market_index"] = out["date"].map(market_by_day)
-        return out
+    def transform(self, df: pd.DataFrame, market_by_day: pd.Series | None = None) -> pd.DataFrame:
+        return self._cleaner.transform(df, daily_market=market_by_day)
 
 
-def flag_corrupted(df, low=0.5, high=2.0):
+def flag_corrupted(df: pd.DataFrame, low: float = 0.50, high: float = 2.00) -> pd.Series:
     """True where $/mile is far from the typical value for its equipment x distance band."""
-    bins = pd.cut(df["distance"], DIST_BINS)
-    rpm = df[TARGET] / df["distance"]
-    typical = rpm.groupby([df["equipment"], bins]).transform("median")
-    ratio = rpm / typical
-    return (ratio < low) | (ratio > high)
+    return flag_corrupted_labels(df, target_col=TARGET, low_ratio=low, high_ratio=high)
 
 
-def make_features(df):
+def make_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Generate tabular feature matrix from raw load records."""
+    fe = FeatureEngineer()
+    raw = fe.extract_features(df)
     X = pd.DataFrame(index=df.index)
-    X["log_dist"] = np.log(df["distance"])
-    X["weight"] = df["weight"]
-    X["equip"] = pd.Categorical(df["equipment"], categories=EQUIPMENT).codes
-    X["market"] = df["market_index"]
-    X["t"] = (df["date"] - START_DATE).dt.days / 30.0
-    if "quote_signal" in df:
-        X["quote"] = df["quote_signal"]
+    X["log_dist"] = raw["log_dist"]
+    X["weight"] = raw["weight"]
+    X["equip"] = raw["equip"]
+    X["market"] = raw["market"]
+    X["t"] = raw["t"]
+    if "quote_signal" in df.columns:
+        X["quote"] = df["quote_signal"].astype(float)
     return X
 
 
-def score(y, p):
-    y, p = np.asarray(y, float), np.asarray(p, float)
-    err = np.abs(y - p)
-    return {"MAE": err.mean(), "RMSE": np.sqrt(((y - p) ** 2).mean()),
-            "MAPE": (err / y).mean() * 100, "WAPE": err.sum() / y.sum() * 100}
+def score(y: Sequence[float], p: Sequence[float]) -> dict[str, float]:
+    """Calculate MAE, RMSE, MAPE, and WAPE."""
+    m = compute_metrics(y, p)
+    return {"MAE": m["MAE"], "RMSE": m["RMSE"], "MAPE": m["MAPE"], "WAPE": m["WAPE"]}
 
 
 class LookupBaseline:
-    def fit(self, df):
-        bins = pd.cut(df["distance"], DIST_BINS)
-        self.table = (df[TARGET] / df["distance"]).groupby([df["equipment"], bins]).median()
+    """Lookup table baseline matching equipment and distance bands."""
+
+    def __init__(self) -> None:
+        self._baseline = LookupTableBaseline()
+
+    def fit(self, df: pd.DataFrame) -> "LookupBaseline":
+        self._baseline.fit(df, target_col=TARGET)
+        self.table = self._baseline.table
         return self
 
-    def predict(self, df):
-        bins = pd.cut(df["distance"], DIST_BINS)
-        keys = pd.MultiIndex.from_arrays([df["equipment"], bins])
-        return self.table.reindex(keys).fillna(self.table.median()).values * df["distance"].values
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        return self._baseline.predict(df)
 
 
 class Hybrid:
-    """Step 1: Ridge line on market (and optionally time). Step 2: GBM on the leftovers."""
-    def __init__(self, linear_cols, gbm_cols=STATIC, alpha=1.0, gbm_params=None):
-        self.linear_cols, self.gbm_cols, self.alpha = linear_cols, gbm_cols, alpha
+    """Step 1: Ridge line on market (and optionally time). Step 2: LightGBM on residuals."""
+
+    def __init__(
+        self,
+        linear_cols: Sequence[str],
+        gbm_cols: Sequence[str] = STATIC,
+        alpha: float = 1.0,
+        gbm_params: dict | None = None,
+    ) -> None:
+        self.linear_cols = list(linear_cols)
+        self.gbm_cols = list(gbm_cols)
+        self.alpha = alpha
         self.gbm_params = {**DEFAULT_GBM, **(gbm_params or {})}
+        include_time = "t" in self.linear_cols
+        self._model = HybridFreightModel(
+            include_time=include_time,
+            gbm_features=self.gbm_cols,
+            alpha=self.alpha,
+            gbm_params=self.gbm_params,
+        )
 
-    def _linear_X(self, df):
-        X = make_features(df)
-        out = X[self.linear_cols].copy()
-        for code in (1, 2):
-            out[f"equip_{code}"] = (X["equip"] == code).astype(int)
-        return out
-
-    def fit(self, df):
-        y = np.log(df[TARGET])
-        X = self._linear_X(df)
-        self.mean, self.std = X.mean(), X.std() + 1e-9
-        self.linear = Ridge(alpha=self.alpha).fit((X - self.mean) / self.std, y)
-        residual = y - self.linear.predict((X - self.mean) / self.std)
-        self.gbm = lgb.LGBMRegressor(**self.gbm_params).fit(make_features(df)[self.gbm_cols], residual)
+    def fit(self, df: pd.DataFrame) -> "Hybrid":
+        self._model.fit(df, target_col=TARGET)
         return self
 
-    def predict_log(self, df):
-        X = (self._linear_X(df) - self.mean) / self.std
-        return self.linear.predict(X) + self.gbm.predict(make_features(df)[self.gbm_cols])
+    def predict_log(self, df: pd.DataFrame) -> np.ndarray:
+        return self._model.predict_log(df)
 
-    def predict(self, df):
-        return np.exp(self.predict_log(df))
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        return self._model.predict(df)
 
 
 class Blend:
     """Average of several models in log space (a geometric mean)."""
-    def __init__(self, models, weights=None):
-        self.models = models
-        self.weights = weights or [1 / len(models)] * len(models)
 
-    def fit(self, df):
-        for m in self.models:
-            m.fit(df)
+    def __init__(
+        self,
+        models: Sequence[Hybrid],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        self.models = list(models)
+        self.weights = list(weights) if weights is not None else [1.0 / len(models)] * len(models)
+        self._blend = GeometricBlendModel(
+            models=[m._model for m in self.models],
+            weights=self.weights,
+        )
+
+    def fit(self, df: pd.DataFrame) -> "Blend":
+        self._blend.fit(df, target_col=TARGET)
         return self
 
-    def predict(self, df):
-        logs = sum(w * m.predict_log(df) for w, m in zip(self.weights, self.models))
-        return np.exp(logs)
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        return self._blend.predict(df)
+
+    def predict_log(self, df: pd.DataFrame) -> np.ndarray:
+        return self._blend.predict_log(df)
